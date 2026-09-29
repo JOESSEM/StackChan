@@ -1,0 +1,144 @@
+diff --git a/firmware/main/hal/board/hal_bridge.h b/firmware/main/hal/board/hal_bridge.h
+index aab08f0..ea1df8c 100644
+--- a/firmware/main/hal/board/hal_bridge.h
++++ b/firmware/main/hal/board/hal_bridge.h
+@@ -9,6 +9,7 @@
+ #include <lvgl.h>
+ #include <driver/i2c_master.h>
+ #include <string_view>
++#include <string>
+ 
+ namespace hal_bridge {
+ 
+@@ -41,6 +42,8 @@ TouchPoint_t get_touch_point();
+ bool is_xiaozhi_mode();
+ void set_xiaozhi_mode(bool mode);
+ void toggle_xiaozhi_chat_state();
++// [proactive] Send text to the AI agent as if the user said it (only when idle)
++bool xiaozhi_invoke_text(const std::string& text);
+ 
+ void disply_lvgl_lock();
+ void disply_lvgl_unlock();
+diff --git a/firmware/main/hal/board/stackchan.cc b/firmware/main/hal/board/stackchan.cc
+index 88963ff..f4c3c77 100644
+--- a/firmware/main/hal/board/stackchan.cc
++++ b/firmware/main/hal/board/stackchan.cc
+@@ -756,3 +756,16 @@ void hal_bridge::toggle_xiaozhi_chat_state()
+     }
+     app.ToggleChatState();
+ }
++
++// [proactive] Let the AI agent speak first: the text is delivered to the server
++// through the wake-word channel (requires CONFIG_SEND_WAKE_WORD_DATA=y) and the
++// agent answers it like a user utterance.
++bool hal_bridge::xiaozhi_invoke_text(const std::string& text)
++{
++    auto& app = Application::GetInstance();
++    if (app.GetDeviceState() != kDeviceStateIdle) {
++        return false;
++    }
++    app.Schedule([text]() { Application::GetInstance().WakeWordInvoke(text); });
++    return true;
++}
+diff --git a/firmware/main/hal/hal.cpp b/firmware/main/hal/hal.cpp
+index 3ca8a14..a0a91fd 100644
+--- a/firmware/main/hal/hal.cpp
++++ b/firmware/main/hal/hal.cpp
+@@ -7,6 +7,8 @@
+ #include <memory>
+ #include <mooncake_log.h>
+ #include <nvs_flash.h>
++#include <mutex>
++#include <string>
+ 
+ static std::unique_ptr<Hal> _hal_instance;
+ static const std::string_view _tag = "HAL";
+@@ -142,6 +144,51 @@ void Hal::xiaozhi_board_init()
+     hal_bridge::xiaozhi_board_init();
+ }
+ 
++// [proactive] Reminder messages waiting to be spoken by the AI agent
++static std::mutex _proactive_mutex;
++static std::string _proactive_pending;
++static uint32_t _proactive_pending_since = 0;
++static constexpr uint32_t kProactiveMaxWaitMs = 10 * 60 * 1000;
++
++static void _proactive_queue(std::string_view msg)
++{
++    std::lock_guard<std::mutex> lock(_proactive_mutex);
++    _proactive_pending       = std::string(msg);
++    _proactive_pending_since = GetHAL().millis();
++}
++
++static void _proactive_update()
++{
++    std::string text;
++    {
++        std::lock_guard<std::mutex> lock(_proactive_mutex);
++        if (_proactive_pending.empty()) {
++            return;
++        }
++        if (GetHAL().millis() - _proactive_pending_since > kProactiveMaxWaitMs) {
++            mclog::tagInfo(_tag, "proactive message expired: {}", _proactive_pending);
++            _proactive_pending.clear();
++            return;
++        }
++        if (!hal_bridge::is_xiaozhi_ready() || !hal_bridge::is_xiaozhi_idle()) {
++            return;  // user is talking or agent busy: try again later
++        }
++        text = _proactive_pending;
++    }
++    if (hal_bridge::xiaozhi_invoke_text(text)) {
++        mclog::tagInfo(_tag, "proactive invoke: {}", text);
++        std::lock_guard<std::mutex> lock(_proactive_mutex);
++        if (_proactive_pending == text) {
++            _proactive_pending.clear();
++        }
++    }
++}
++
++// [proactive] Spoken once after power-on (e.g. when the car starts)
++static constexpr const char* kProactiveBootMessage =
++    "[시동] 방금 전원이 켜졌어. get_schedule 도구로 오늘 일정을 확인해서 일정이 있으면 짧게 알려줘. "
++    "그다음 운전 중인지 물어보고, 운전 중이라고 하면 start_drive_mode 도구를 호출해.";
++
+ static void _stackchan_update_task(void* param)
+ {
+     bool is_setup_done = false;
+@@ -150,6 +197,7 @@ static void _stackchan_update_task(void* param)
+         vTaskDelay(pdMS_TO_TICKS(20));
+ 
+         tools::update_reminders();
++        _proactive_update();
+ 
+         LvglLockGuard lock;
+ 
+@@ -169,6 +217,7 @@ static void _stackchan_update_task(void* param)
+             view::create_home_indicator([]() { GetHAL().requestWarmReboot(0); }, 0x81DBBD, 0x134233);
+             view::create_status_bar(0x81DBBD, 0x134233);
+             is_setup_done = true;
++            _proactive_queue(kProactiveBootMessage);
+         }
+ 
+         view::update_home_indicator();
+@@ -194,6 +243,7 @@ void Hal::startXiaozhi()
+             avatar.addDecorator(std::make_unique<view::ReminderView>(lv_screen_active(), msg));
+         }
+         hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
++        _proactive_queue(msg);
+     });
+ 
+     // Start stackchan update task
+diff --git a/firmware/sdkconfig.defaults b/firmware/sdkconfig.defaults
+index 4db623a..3069bad 100644
+--- a/firmware/sdkconfig.defaults
++++ b/firmware/sdkconfig.defaults
+@@ -9,7 +9,7 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+ CONFIG_PARTITION_TABLE_CUSTOM=y
+ CONFIG_LANGUAGE_EN_US=y
+ CONFIG_BOARD_TYPE_M5STACK_STACK_CHAN=y
+-CONFIG_SEND_WAKE_WORD_DATA=n
++CONFIG_SEND_WAKE_WORD_DATA=y
+ CONFIG_SR_WN_WN9_HISTACKCHAN_TTS3=y
+ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+ CONFIG_COMPILER_CXX_EXCEPTIONS=y
