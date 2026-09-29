@@ -41,7 +41,7 @@ index 88963ff..f4c3c77 100644
 +    return true;
 +}
 diff --git a/firmware/main/hal/hal.cpp b/firmware/main/hal/hal.cpp
-index 3ca8a14..a0a91fd 100644
+index 3ca8a14..4fe008c 100644
 --- a/firmware/main/hal/hal.cpp
 +++ b/firmware/main/hal/hal.cpp
 @@ -7,6 +7,8 @@
@@ -53,7 +53,7 @@ index 3ca8a14..a0a91fd 100644
  
  static std::unique_ptr<Hal> _hal_instance;
  static const std::string_view _tag = "HAL";
-@@ -142,6 +144,51 @@ void Hal::xiaozhi_board_init()
+@@ -142,6 +144,56 @@ void Hal::xiaozhi_board_init()
      hal_bridge::xiaozhi_board_init();
  }
  
@@ -61,13 +61,15 @@ index 3ca8a14..a0a91fd 100644
 +static std::mutex _proactive_mutex;
 +static std::string _proactive_pending;
 +static uint32_t _proactive_pending_since = 0;
++static uint32_t _proactive_not_before    = 0;
 +static constexpr uint32_t kProactiveMaxWaitMs = 10 * 60 * 1000;
 +
-+static void _proactive_queue(std::string_view msg)
++static void _proactive_queue(std::string_view msg, uint32_t delay_ms = 0)
 +{
 +    std::lock_guard<std::mutex> lock(_proactive_mutex);
 +    _proactive_pending       = std::string(msg);
 +    _proactive_pending_since = GetHAL().millis();
++    _proactive_not_before    = _proactive_pending_since + delay_ms;
 +}
 +
 +static void _proactive_update()
@@ -79,8 +81,11 @@ index 3ca8a14..a0a91fd 100644
 +            return;
 +        }
 +        if (GetHAL().millis() - _proactive_pending_since > kProactiveMaxWaitMs) {
-+            mclog::tagInfo(_tag, "proactive message expired: {}", _proactive_pending);
++            mclog::tagInfo(_tag, "proactive message expired");
 +            _proactive_pending.clear();
++            return;
++        }
++        if (GetHAL().millis() < _proactive_not_before) {
 +            return;
 +        }
 +        if (!hal_bridge::is_xiaozhi_ready() || !hal_bridge::is_xiaozhi_idle()) {
@@ -89,7 +94,7 @@ index 3ca8a14..a0a91fd 100644
 +        text = _proactive_pending;
 +    }
 +    if (hal_bridge::xiaozhi_invoke_text(text)) {
-+        mclog::tagInfo(_tag, "proactive invoke: {}", text);
++        mclog::tagInfo(_tag, "proactive invoke ({} bytes)", text.size());
 +        std::lock_guard<std::mutex> lock(_proactive_mutex);
 +        if (_proactive_pending == text) {
 +            _proactive_pending.clear();
@@ -105,7 +110,7 @@ index 3ca8a14..a0a91fd 100644
  static void _stackchan_update_task(void* param)
  {
      bool is_setup_done = false;
-@@ -150,6 +197,7 @@ static void _stackchan_update_task(void* param)
+@@ -150,6 +202,7 @@ static void _stackchan_update_task(void* param)
          vTaskDelay(pdMS_TO_TICKS(20));
  
          tools::update_reminders();
@@ -113,22 +118,41 @@ index 3ca8a14..a0a91fd 100644
  
          LvglLockGuard lock;
  
-@@ -169,6 +217,7 @@ static void _stackchan_update_task(void* param)
+@@ -169,6 +222,7 @@ static void _stackchan_update_task(void* param)
              view::create_home_indicator([]() { GetHAL().requestWarmReboot(0); }, 0x81DBBD, 0x134233);
              view::create_status_bar(0x81DBBD, 0x134233);
              is_setup_done = true;
-+            _proactive_queue(kProactiveBootMessage);
++            _proactive_queue(kProactiveBootMessage, 8000);  // let the network settle first
          }
  
          view::update_home_indicator();
-@@ -194,6 +243,7 @@ void Hal::startXiaozhi()
+@@ -187,17 +241,23 @@ void Hal::startXiaozhi()
+     // Setup reminder handler
+     tools::on_reminder_triggered().clear();
+     tools::on_reminder_triggered().connect([](int id, std::string_view msg) {
+-        mclog::tagInfo(_tag, "reminder triggered: id: {}, msg: {}", id, msg);
+-        {
++        // [proactive] Messages starting with '[' are spoken by the AI agent, so skip the popup.
++        // (The popup label uses a Latin-only font; long Korean text there is heavy on this small task stack.)
++        const bool proactive = !msg.empty() && msg.front() == '[';
++        mclog::tagInfo(_tag, "reminder triggered: id: {}, proactive: {}", id, proactive);
++        if (!proactive) {
+             LvglLockGuard lock;
+             auto& avatar = GetStackChan().avatar();
              avatar.addDecorator(std::make_unique<view::ReminderView>(lv_screen_active(), msg));
          }
          hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
-+        _proactive_queue(msg);
++        if (proactive) {
++            _proactive_queue(msg);
++        }
      });
  
      // Start stackchan update task
+-    xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
++    xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 8192, NULL, 3, NULL, 1);
+ 
+     hal_bridge::start_xiaozhi_app();
+ }
 diff --git a/firmware/sdkconfig.defaults b/firmware/sdkconfig.defaults
 index 4db623a..3069bad 100644
 --- a/firmware/sdkconfig.defaults
